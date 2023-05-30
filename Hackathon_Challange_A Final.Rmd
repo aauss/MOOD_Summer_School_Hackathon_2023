@@ -1,0 +1,214 @@
+---
+title: "Hackathon MOOD 2023 Seb/Auss"
+output: html_document
+date: "2023-05-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# MOOD Summer School 2023 Hackathon
+In this hackathon, we try to predict the number of consultations at a veterinarian that will detect ticks within the UK across 2014-2021. 
+
+The ground truth data on the presence of ticks is curated by [Alan Radford](https://www.liverpool.ac.uk/infection-veterinary-and-ecological-sciences/staff/alan-radford/) at University of Liverpool. They used text mining on electronic health records of companion animals to detect if a tick was present on animals. As covariates, we use numerous environmental data. UK is divided in 1x1km grids for which we have the number of consultations, found ticks, and environmental covariats.
+
+```{r}
+# This functions makes it quick to install and load necessary packages
+dynamic_require <- function(package) {
+  if (eval(parse(text = paste("require(", package, ")"))))
+    return(TRUE)
+  install.packages(package)
+  return(eval(parse(text = paste(
+    "require(", package, ")"
+  ))))
+}
+
+# make a list of all necessary functions
+functions <-
+  list(
+    "sf",
+    "raster",
+    "crsuggest",
+    "osmdata",
+    "cancensus",
+    "readr",
+    "dplyr",
+    "mapview",
+    "readxl",
+    "ggplot2",
+    "xgboost",
+    "reshape",
+    "party",
+    "pROC",
+    "mice"
+  )
+# install them all at once
+installed =lapply(functions, dynamic_require)
+```
+
+## Load data
+We are going to test and train our model on a training set. Later for evaluation, we will predict the number of detected ticks on a validation set. In this block, we make sure to use the same format for both datasets.
+
+```{r}
+# Validation data
+eval_data = readRDS("/Users/aussabbood/Desktop/gb1km/static/data_1km_static.rds")  # Static env. covariats
+eval_table = read_csv("/Users/aussabbood/Downloads/MOOD_Summer_School_2023 - Validation_set.csv")
+eval_table = tidyr::drop_na(eval_table,  c("X", "Y"))
+
+crs <- CRS("+init=epsg:27700")
+spdf <-
+  SpatialPointsDataFrame(coords      = eval_table[, c("X", "Y")],
+                         data        = eval_table[, c("Time_step", "Ticks", "Grid_ID")],
+                         proj4string = crs)
+
+validation_data <- cbind(spdf, over(spdf, eval_data))@data
+validation_data$X = spdf@coords[,1]
+validation_data$Y = spdf@coords[,2]
+```
+
+```{r}
+# Training data
+rep = "http://s3.eu-central-1.wasabisys.com/mood/training/"
+rds = url(paste0(rep, "ticks_training_set.rds"))
+train_data = readRDS(rds)
+```
+
+
+## Data Pre-processing
+For our modelling steps, we need to transform the date variable to a more appropiate format, deal with missing values, and remove columns that we do not want when traning our models.
+
+```{r}
+set.seed(10)
+# Char date to num
+train_data <-
+  train_data %>% mutate(year = as.numeric(format(as.Date(Date, format = "%d/%m/%Y"), "%Y")),
+                        month = as.numeric(format(as.Date(Date, format = "%d/%m/%Y"), "%m"))) %>% select(c(names(validation_data), c("year", "month")))
+
+has_nans = names(which(colSums(is.na(train_data)) > 0))
+to_remove = has_nans %>% str_subset(pattern = "snow*")
+
+# Remove non-features
+train_data = train_data %>% select(
+  -c(
+    "Time_step",
+    "Grid_ID",
+    "sti.ovr_hydrography90m_m_1km_s_20000101_20201231_gb_epsg.27700_v20230207",
+    "twi_merit.dem_m_1km_s_20000101_20201231_gb_epsg.27700_v20230207",
+    "slope.elv.dw_hydrography90m_m_1km_s_20000101_20201231_gb_epsg.27700_v20230207",
+    "outlet.diff.dw.basin_hydrography90m_m_1km_s_20000101_20201231_gb_epsg.27700_v20230207",
+  )
+) %>% select(-to_remove) 
+
+NA2mean <- function(x) replace(x, is.na(x), mean(x, na.rm = TRUE))
+train_data = replace(train_data, TRUE, lapply(train_data, NA2mean))
+```
+
+
+## Base line
+This is how good we need to be at least. The simplest model, only predicting one tick per grid has an RSME of 0.73.
+
+```{r}
+RMSE = function(m, o){
+  sqrt(mean((m - o)^2))
+}
+RMSE(train_data$Ticks, replicate(nrow(train_data), 1)
+)
+```
+With the kNN model, we try to catch the spatial nature of the tick distribution. We try to find the best number of k using cross-validation.
+
+```{r}
+trainControl <- caret::trainControl(method="repeatedcv", number=5, repeats=2)
+metric <- "RMSE"
+
+fit.knn <- caret::train(
+  Ticks ~ X + Y,
+  data = train_data,
+  method = "knn",
+  metric = metric ,
+  trControl = trainControl
+)
+knn.k1 <-
+  fit.knn$bestTune # keep this Initial k for testing with knn() function in next section
+print(fit.knn)
+```
+When using all features, we resort to XGBoost, which usually shows a strong performance and low sensibility towards highly corralated features.
+
+```{r}
+bst_model <-
+  xgboost(
+    data = as.matrix(train_data%>% select(-c("Ticks"))),
+    label =  train_data$Ticks,
+    max.depth = 5,
+    nthread = 2,
+    nrounds = 5,
+    objective = "reg:squarederror",
+    eval.metric = "rmse",
+  )
+
+```
+We can combine both models using their predictions as input to a linear model.
+
+```{r}
+bst_pred = predict(bst_model, as.matrix(train_data%>% select(-c("Ticks"))))
+knn_pred = predict(fit.knn, train_data)
+ensemble_df = tibble(bst_pred, knn_pred, train_data$Ticks)
+ens = lm(train_data$Ticks~ bst_pred + knn_pred , data = ensemble_df)
+
+RMSE(train_data$Ticks, predict(ens, ensemble_df))
+```
+
+Here, we apply the samte pre-processing to the validation data as we did with the training data.
+
+```{r}
+validation_data <-
+  validation_data %>% mutate(year = as.numeric(str_sub(Time_step, start = -4)), month = as.numeric((str_sub(Time_step, end = 2))))
+to_remove = has_nans %>% str_subset(pattern = "snow*")
+
+# Remove non-features
+validation_data = validation_data %>% select(
+  -c(
+    "Time_step",
+    "sti.ovr_hydrography90m_m_1km_s_20000101_20201231_gb_epsg.27700_v20230207",
+    "twi_merit.dem_m_1km_s_20000101_20201231_gb_epsg.27700_v20230207",
+    "slope.elv.dw_hydrography90m_m_1km_s_20000101_20201231_gb_epsg.27700_v20230207",
+    "outlet.diff.dw.basin_hydrography90m_m_1km_s_20000101_20201231_gb_epsg.27700_v20230207",
+  )
+) %>% select(-to_remove) 
+
+NA2mean <- function(x) replace(x, is.na(x), mean(x, na.rm = TRUE))
+validation_data = replace(validation_data, TRUE, lapply(validation_data, NA2mean))
+```
+
+Now, we use the trained models and predict ticks using the kNN and XGBoost, which are combined in the above trained linear model.
+
+```{r}
+#validation_data = validation_data %>% select(-c("Grid_ID"))
+bst_pred = predict(bst_model, as.matrix(validation_data[, names(train_data %>% select(-c("Ticks")))]))
+knn_pred = predict(fit.knn, newdata=validation_data[, names(train_data)])
+ensemble_df = tibble(bst_pred, knn_pred, validation_data$Ticks)
+final_preds = predict(ens, ensemble_df)
+```
+
+Let us finally validate, that we did no mistake with formatting the results prior to uploading them. We re-transform the date into the original format for merging with the validation data set.
+
+```{r}
+library(glue)
+library(stringr)
+Time_step = validation_data %>% 
+    glue_data("{month}/{year}") %>% as.character()
+Time_step = str_pad(Time_step, 7, pad = "0")
+Grid_ID = validation_data$Grid_ID
+write_csv(tibble(Time_stamp, Grid_ID, final_preds), "seb_auss_challange_a.csv")
+```
+
+```{r}
+# sanity check
+google_sheet = eval_table[, c("Time_step", "Grid_ID")]
+our_results = tibble(Time_step, Grid_ID, final_preds)[, c("Time_step", "Grid_ID")]
+
+dplyr::all_equal(google_sheet, our_results)
+```
+
+## Appendix
+We tried also GLMs, removing highly correlated variables, and used decision trees and XGBoost to pick more important features. However, we could not see any gain in performance.
